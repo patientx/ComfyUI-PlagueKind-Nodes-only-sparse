@@ -1,9 +1,10 @@
 """The H3 SLA Attention node.
 
-Drop it on the MODEL wire after the LoRA loaders, last before the sampler. It
-replaces MiniMax-H3 self-attention with the block-sparse kernel that the
-lightx2v SLA turbo LoRA was distilled against, which is the piece ComfyUI does
-not otherwise have -- and the reason that LoRA gives no speedup on its own.
+Drop it on the MODEL wire after the LoRA loaders and any dense attention
+backend, last before the sampler. It replaces MiniMax-H3 self-attention with
+the block-sparse kernel that the lightx2v SLA turbo LoRA was distilled against,
+which is the piece ComfyUI does not otherwise have -- and the reason that LoRA
+gives no speedup on its own.
 """
 
 from __future__ import annotations
@@ -43,12 +44,15 @@ class H3SLAAttention(io.ComfyNode):
             description=(
                 "Block-sparse attention for MiniMax-H3, matching the inference "
                 "path the lightx2v SLA turbo LoRA was trained for. Place it "
-                "after your LoRA loader, last before the sampler. Long "
+                "after your LoRA loader and dense attention backend, last "
+                "before the sampler. Long "
                 "sequences benefit most, so the gain grows with resolution and "
                 "duration; short ones fall back to dense automatically."),
             inputs=[
                 io.Model.Input("model",
-                    tooltip="MODEL, after the LoRA loader(s)."),
+                    tooltip=(
+                        "MODEL, after the LoRA loader(s) and any dense "
+                        "attention backend such as Comfy Kitchen.")),
                 io.Float.Input("sparsity_ratio", default=0.90, min=0.0, max=0.95,
                     step=0.05, round=False,
                     tooltip=(

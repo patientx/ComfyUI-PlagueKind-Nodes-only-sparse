@@ -10,12 +10,18 @@ LoRA alone changes weights but does not install a sparse attention backend.
 
 Category: `PlagueKind/model_patches/minimax`
 
-Place the node on the `MODEL` connection after all LoRA loaders and immediately
-before the sampler:
+Place the node on the `MODEL` connection after all LoRA loaders and any dense
+attention backend, immediately before the sampler:
 
 ```text
-MODEL -> LoRA loader(s) -> H3 SLA Attention -> sampler
+MODEL -> LoRA loader(s) -> Model Attention Backend [Kitchen] -> H3 SLA Attention -> sampler
 ```
+
+The `Model Attention Backend` node set to `comfy kitchen attention` is optional.
+When present, SLA handles eligible long H3 self-attention calls and delegates
+short sequences, masked attention, trailing dense steps, unsupported calls,
+and kernel fallbacks to Kitchen. Putting Kitchen after SLA would replace the
+sparse override, so SLA must be last.
 
 The node clones and patches the model. It does not modify model weights or
 download a LoRA. On unsupported models, short sequences, disabled runs, or

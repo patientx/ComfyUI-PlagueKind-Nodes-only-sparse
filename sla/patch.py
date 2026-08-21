@@ -67,19 +67,32 @@ def _summarise(state, sparsity, blkq, blkk):
 
 
 def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
-                   protect_audio=True):
+                   protect_audio=True, dense_override=None):
     topk_ratio = 1.0 - sparsity_ratio
 
     def override(func, q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kwargs):
         def dense():
             state["dense"] += 1
+            if dense_override is not None:
+                # Compose with a workflow-selected backend such as Comfy
+                # Kitchen. Both nodes use optimized_attention_override, so
+                # simply replacing the value would otherwise make the last
+                # node win. The previous override receives ComfyUI's original
+                # backend in the same form wrap_attn would have supplied it.
+                return dense_override(
+                    func, q, k, v, heads,
+                    mask=mask, attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape, **kwargs,
+                )
             return func(q, k, v, heads, mask=mask, attn_precision=attn_precision,
                         skip_reshape=skip_reshape,
                         skip_output_reshape=skip_output_reshape, **kwargs)
 
         if state["backend"] is None:
-            state["backend"] = getattr(func, "__name__", repr(func))
+            backend = dense_override if dense_override is not None else func
+            state["backend"] = getattr(backend, "__name__", repr(backend))
 
         to = kwargs.get("transformer_options") or {}
 
@@ -215,9 +228,10 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     patched = model.clone()
 
     to = patched.model_options.get("transformer_options", {}).copy()
+    dense_override = to.get("optimized_attention_override")
     to["optimized_attention_override"] = _make_override(
         state, float(sparsity_ratio), blkq, blkk, int(min_seq_len),
-        bool(protect_audio))
+        bool(protect_audio), dense_override=dense_override)
     patched.model_options["transformer_options"] = to
 
     patched.add_wrapper_with_key(

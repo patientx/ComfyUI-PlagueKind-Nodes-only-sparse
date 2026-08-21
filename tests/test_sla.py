@@ -75,6 +75,41 @@ class OverrideContract(unittest.TestCase):
         self.assertEqual(state["dense"], 1)
         self.assertEqual(out.shape, (1, 512, H * D))
 
+    def test_existing_attention_backend_handles_dense_fallbacks(self):
+        """Kitchen before SLA remains active for calls SLA leaves dense."""
+        calls = []
+
+        def kitchen_override(func, q, k, v, heads, **kwargs):
+            calls.append((func, kwargs))
+            return torch.full((q.shape[0], q.shape[2], heads * q.shape[-1]), 7.0)
+
+        class Model:
+            def __init__(self):
+                self.model_options = {
+                    "transformer_options": {
+                        "optimized_attention_override": kitchen_override,
+                    },
+                }
+                self.wrapper = None
+
+            def clone(self):
+                return self
+
+            def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+                self.wrapper = (wrapper_type, key, wrapper)
+
+        patched = sla_patch.patch_h3_sla(Model(), min_seq_len=8192)
+        override = patched.model_options["transformer_options"][
+            "optimized_attention_override"
+        ]
+        q = torch.randn(1, H, 512, D)
+        out = self._call(override, q, q.clone(), q.clone())
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][0], _backend)
+        self.assertTrue(calls[0][1]["_inside_attn_wrapper"])
+        self.assertTrue(torch.equal(out, torch.full_like(out, 7.0)))
+
     def test_records_the_backend_it_displaced(self):
         state = sla_patch._new_state()
         ov = sla_patch._make_override(state, 0.85, 128, 64, min_seq_len=8192)
