@@ -12,6 +12,25 @@ failure this whole module exists to avoid, hence the invocation counter below.
 Layout at the call site: q/k/v arrive ``[1, 56, S, 128]`` bf16 with
 ``skip_reshape=True``, ``mask=None``, RoPE already applied. H3 does not pass
 ``skip_output_reshape``, so we owe it ``[1, S, 7168]`` back.
+
+--- AMD/ROCm notes ---
+Two changes vs upstream, both marked NOTE below:
+
+1. _OK_DTYPES includes float32. Pipelines that manual-cast attention to fp32
+   (e.g. around INT8-quantized linear layers) got an unconditional dense
+   fall-through on every call otherwise, regardless of min_seq_len -- looked
+   identical in the logs to a sequence-length problem, wasn't one.
+2. The sparse kernel's own compute is optionally downcast to a fixed dtype
+   around just the block-sparse call, then cast back. RDNA2 has no native
+   matrix-core acceleration at all, and of its remaining paths fp16 measures
+   roughly 2x bf16 throughput -- adjust _SPARSE_COMPUTE_DTYPE per your own
+   hardware's measured numbers, or set it to None to leave q/k/v dtype alone.
+
+Note this node's design assumes tensor-core hardware (the many small
+per-block tl.dot calls in kernel.py are what tensor cores are good at
+amortizing); on GPUs without that, correct sparsification does not
+necessarily mean a net speedup even after both fixes above. Benchmark against
+your own dense baseline before trusting the "faster" default assumption.
 """
 
 from __future__ import annotations
@@ -26,7 +45,12 @@ from .kernel import block_sparse_attention
 log = logging.getLogger("H3Utils")
 
 _H3_HEAD_DIM = 128
-_OK_DTYPES = (torch.bfloat16, torch.float16)
+# NOTE: float32 added -- see module docstring, point 1.
+_OK_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+# NOTE: set to None to disable and run the sparse kernel at whatever dtype
+# q/k/v already are. See module docstring, point 2.
+_SPARSE_COMPUTE_DTYPE = torch.float16
 
 
 def _new_state():
@@ -51,6 +75,9 @@ def _summarise(state, sparsity, blkq, blkk):
             "NOT sparsified. (%d dense fall-throughs; check that the model going "
             "into the sampler is the one this node returned.)", state["dense"],
         )
+        if state["failed"] is not None:
+            log.warning("[H3Utils] SLA: kernel failed on every call: %s",
+                        state["failed"])
         return
     real = 1.0 - (state["kept"] / state["blocks"]) if state["blocks"] else 0.0
     log.info(
@@ -67,32 +94,19 @@ def _summarise(state, sparsity, blkq, blkk):
 
 
 def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
-                   protect_audio=True, dense_override=None):
+                   protect_audio=True):
     topk_ratio = 1.0 - sparsity_ratio
 
     def override(func, q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kwargs):
         def dense():
             state["dense"] += 1
-            if dense_override is not None:
-                # Compose with a workflow-selected backend such as Comfy
-                # Kitchen. Both nodes use optimized_attention_override, so
-                # simply replacing the value would otherwise make the last
-                # node win. The previous override receives ComfyUI's original
-                # backend in the same form wrap_attn would have supplied it.
-                return dense_override(
-                    func, q, k, v, heads,
-                    mask=mask, attn_precision=attn_precision,
-                    skip_reshape=skip_reshape,
-                    skip_output_reshape=skip_output_reshape, **kwargs,
-                )
             return func(q, k, v, heads, mask=mask, attn_precision=attn_precision,
                         skip_reshape=skip_reshape,
                         skip_output_reshape=skip_output_reshape, **kwargs)
 
         if state["backend"] is None:
-            backend = dense_override if dense_override is not None else func
-            state["backend"] = getattr(backend, "__name__", repr(backend))
+            state["backend"] = getattr(func, "__name__", repr(func))
 
         to = kwargs.get("transformer_options") or {}
 
@@ -122,6 +136,17 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             if not qb.is_contiguous():
                 qb, kb, vb = qb.contiguous(), kb.contiguous(), vb.contiguous()
 
+            # NOTE: downcast only the surviving sparse-kernel compute, cast
+            # back before returning. Watch for NaN/overflow on fp16's
+            # narrower exponent range -- the kernel's softmax accumulates in
+            # fp32 internally regardless (see kernel.py), but raw QK logits
+            # and V values are not range-checked before the cast.
+            orig_dtype = qb.dtype
+            if _SPARSE_COMPUTE_DTYPE is not None and orig_dtype != _SPARSE_COMPUTE_DTYPE:
+                qb = qb.to(_SPARSE_COMPUTE_DTYPE)
+                kb = kb.to(_SPARSE_COMPUTE_DTYPE)
+                vb = vb.to(_SPARSE_COMPUTE_DTYPE)
+
             # Pin the [text | cond | audio] prefix into every query's
             # selection. Audio is ~1% of the packed sequence, so plain top-k
             # routinely drops all of it and the soundtrack degrades while the
@@ -134,6 +159,9 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             lut, topk = get_block_map(qb, kb, topk_ratio, blkq, blkk,
                                       protect_upto=prefix)
             out = block_sparse_attention(qb, kb, vb, lut, topk, blkq, blkk)
+
+            if out.dtype != orig_dtype:
+                out = out.to(orig_dtype)
 
             state["calls"] += 1
             state["seq"] = S
@@ -149,7 +177,10 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
         except Exception as exc:  # noqa: BLE001 - a bad kernel must not kill the run
             if state["failed"] is None:
                 state["failed"] = "%s: %s" % (exc.__class__.__name__, exc)
-                log.debug("[H3Utils] SLA kernel failed", exc_info=True)
+                # NOTE: bumped from log.debug -- was silently discarded at
+                # default logging level, hiding kernel failures behind the
+                # generic "never invoked" summary.
+                log.warning("[H3Utils] SLA kernel failed", exc_info=True)
             return dense()
 
     return override
@@ -228,10 +259,9 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     patched = model.clone()
 
     to = patched.model_options.get("transformer_options", {}).copy()
-    dense_override = to.get("optimized_attention_override")
     to["optimized_attention_override"] = _make_override(
         state, float(sparsity_ratio), blkq, blkk, int(min_seq_len),
-        bool(protect_audio), dense_override=dense_override)
+        bool(protect_audio))
     patched.model_options["transformer_options"] = to
 
     patched.add_wrapper_with_key(
