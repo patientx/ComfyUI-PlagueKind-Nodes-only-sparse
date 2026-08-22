@@ -176,16 +176,35 @@ def _attn_fwd(
     tl.store(OS_ptrs, o_s.to(OS.type.element_ty), mask=offs_m[:, None] < LQ)
 
 
+# Confirmed-by-measurement shortcuts: (BLOCK_M, BLOCK_N, D, arch) -> (num_warps,
+# num_stages), bypassing the timed sweep entirely for shapes proven stable.
+# only for rx 6800, these are best fixed values 
+_KNOWN_GOOD = {
+    (64, 64, 128, "gfx1030"): (4, 2),
+}
+
 # Candidate (num_warps, num_stages) pairs to time per (BLOCK_M, BLOCK_N).
 # This is a curated search space, not an exhaustive one -- autotune below
 # times whichever of these actually launch and keeps the fastest, it does
 # not just accept the first.
+#
+# NOTE: trimmed to num_warps=4 only. num_warps=2 candidates were in the
+# original ladder but never won an autotuned comparison on gfx1030 in
+# practice; keeping them roughly doubles one-time JIT-compile cost on first
+# use of a new shape (the actual dominant cost of autotuning, not rep count)
+# for candidates that don't end up winning anyway. Re-add num_warps=2 entries
+# if you're tuning for different hardware where that assumption doesn't hold.
 _LADDER = {
-    (64, 64): ((4, 2), (2, 2), (4, 1), (2, 1)),
-    (64, 32): ((4, 2), (2, 2), (4, 1), (2, 1)),
-    (32, 64): ((4, 2), (2, 2), (4, 1), (2, 1)),
-    (128, 64): ((4, 2), (4, 1), (2, 2), (2, 1)),
-    (64, 128): ((4, 2), (4, 1), (2, 2), (2, 1)),
+    (64, 64): ((4, 2), (4, 1)),
+    (64, 32): ((4, 2), (4, 1)),
+    (32, 64): ((4, 2), (4, 1)),
+    (128, 64): ((4, 2), (4, 1)),
+    (64, 128): ((4, 2), (4, 1)),
+
+                                                                         
+                                                                         
+                                                                         
+                            
 }
 _CHOSEN: dict = {}  # in-process cache, avoids re-touching disk every call
 
@@ -251,6 +270,15 @@ def block_sparse_attention(q, k, v, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None):
         _launch(grid, q, k, v, qk_scale, topk, lut, o_s, H, LQ, LK, M_BLOCKS,
                 D, BLOCK_M, BLOCK_N, num_warps, num_stages)
         return o_s
+
+    # Confirmed-by-measurement shortcut: same tile shape + arch already
+    # proven stable across many sequence lengths, no need to time anything.
+    # Not cached into _CHOSEN/_CHOSEN_CACHE below -- it's a static table
+    # entry, not a discovered result, and shouldn't be treated as one if
+    # this dict is ever edited.
+    known = _KNOWN_GOOD.get((BLOCK_M, BLOCK_N, D, arch))
+    if known is not None:
+        return run_with(known)
 
     # In-process cache: already resolved this exact shape+arch this run.
     if key in _CHOSEN:
