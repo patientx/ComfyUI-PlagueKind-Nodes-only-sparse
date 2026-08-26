@@ -1,4 +1,4 @@
-"""The H3 SLA Attention - ROCM node.
+"""The H3 SLA Attention node.
 
 Drop it on the MODEL wire after the LoRA loaders, last before the sampler. It
 replaces MiniMax-H3 self-attention with the block-sparse kernel that the
@@ -129,7 +129,7 @@ class H3SLAAttention(io.ComfyNode):
                 # workflows -- which can store widget values positionally --
                 # keep lining up with the right inputs instead of shifting
                 # onto whatever got inserted ahead of them.
-                io.String.Input("dense_steps", default="0", optional=True,
+                io.String.Input("dense_steps", default="", optional=True,
                     tooltip=(
                         "Explicit 0-based step indices to force dense, on top "
                         "of dense_last_steps -- e.g. '0,1' or '0-2'. Early "
@@ -193,7 +193,7 @@ class H3SLAAttention(io.ComfyNode):
     @classmethod
     def execute(cls, model, sparsity_ratio=0.90, block_size="64",
                 min_seq_len=4096, dense_last_steps=1, protect_audio=True,
-                enabled=True, dense_steps="0", dense_backend="auto",
+                enabled=True, dense_steps="", dense_backend="auto",
                 disable_fp16_accum=True, stabilize_motion=True) -> io.NodeOutput:
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
