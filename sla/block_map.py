@@ -81,7 +81,24 @@ def mean_pool(x, BLK):
     return x_mean
 
 
-def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0):
+# How large a nudge a previously-selected block gets, as a fraction of that
+# query row's own max score -- relative, not absolute, since raw dot-product
+# magnitude varies by layer and by how far into denoising a step is. Not
+# exposed as a node parameter: small enough that a genuinely better block
+# still wins, big enough to kill a near-tie flip between steps that isn't
+# telling you anything real.
+_STICKY_BONUS_FRAC = 0.05
+# Only selections near the top-k cutoff can realistically flip on the next
+# step. Retaining the complete LUT for all 50 H3 layers makes stabilization
+# state scale as O(NQ * topk) -- several GB at 768p -- for a nudge that only
+# ever matters at the boundary. Eight boundary entries per query row keep
+# the intended hysteresis while making the retained state O(NQ) with a
+# small constant.
+_STICKY_HISTORY_WIDTH = 8
+
+
+def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
+                  prev_lut=None, return_history=False):
     """Return ``(lut, topk)``: the key blocks each query block should attend to.
 
     ``q``/``k`` are ``(B, L, H, D)`` contiguous. ``lut`` comes back as
@@ -94,6 +111,16 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0):
     and the smooth-k mean it is scored against is 99% video. The pinned blocks
     are added on top of the top-k budget rather than displacing video, so video
     coverage is unchanged and the extra cost is the prefix itself (~7%).
+
+    ``prev_lut``, when given the previous call's ``lut`` for this same layer,
+    nudges those blocks' scores up before top-k -- pure per-step top-k has no
+    memory, so on a near-tie between two similarly-scored blocks the winner
+    can flip step to step for no reason tied to actual content, and on fast
+    motion that shows up as a faint double-exposure rather than one clean
+    pick. The nudge only breaks a close call; a block that's actually a
+    better fit this step still wins. Silently ignored if its shape doesn't
+    match this call's (e.g. right after a dense step, or the first sparse
+    call of a run).
     """
     pooled_q = mean_pool(q, BLKQ)
     # Smooth-k (SageAttention's trick), folded in rather than materialised.
@@ -108,6 +135,15 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0):
 
     pooled_score = pooled_q @ pooled_k.transpose(-1, -2)      # (B, H, NQ, NK)
 
+    if (
+        prev_lut is not None
+        and prev_lut.shape[:3] == pooled_score.shape[:3]
+        and prev_lut.shape[-1] <= pooled_score.shape[-1]
+    ):
+        row_scale = pooled_score.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+        bonus = (row_scale * _STICKY_BONUS_FRAC).expand(*prev_lut.shape)
+        pooled_score.scatter_add_(-1, prev_lut.long(), bonus)
+
     NK = pooled_score.shape[-1]
     # FIX vs upstream: keep at least one key block.
     topk = max(1, min(NK, int(topk_ratio * NK)))
@@ -121,6 +157,24 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0):
             pooled_score[..., :n_pinned] = float("inf")
             topk = min(NK, topk + n_pinned)
 
-    lut = torch.topk(pooled_score, topk, dim=-1, sorted=False).indices
+    selected = torch.topk(pooled_score, topk, dim=-1, sorted=False)
+    lut = selected.indices
+    lut_i32 = lut.to(torch.int32).contiguous()
 
-    return lut.to(torch.int32).contiguous(), topk
+    if not return_history:
+        return lut_i32, topk
+
+    # Bound what stabilize_motion carries into the next step to the
+    # entries nearest the cutoff -- the only ones that can plausibly flip.
+    # Strong selections do not need a sticky bonus, so dropping them from
+    # the retained history costs nothing but the VRAM they were sitting on.
+    history_width = min(_STICKY_HISTORY_WIDTH, topk)
+    if history_width == topk:
+        history = lut
+    else:
+        boundary_pos = torch.topk(
+            selected.values, history_width, dim=-1, largest=False, sorted=False
+        ).indices
+        history = torch.gather(lut, -1, boundary_pos)
+
+    return lut_i32, topk, history.to(torch.int32).contiguous()
