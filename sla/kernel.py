@@ -178,7 +178,25 @@ def _attn_fwd(
 
 # Confirmed-by-measurement shortcuts: (BLOCK_M, BLOCK_N, D, arch) -> (num_warps,
 # num_stages), bypassing the timed sweep entirely for shapes proven stable.
-# only for rx 6800, these are best fixed values 
+#
+# num_warps/num_stages govern shared-memory and register footprint PER TILE,
+# fixed entirely by (BLOCK_M, BLOCK_N, D). Sequence length and topk only
+# change how many times the kernel's internal loop runs (tl.range(topk) in
+# _attn_fwd), not the per-iteration resource footprint -- so there was never
+# a reason to expect the optimal config to vary with sequence length, only
+# with tile shape. Confirmed empirically: (4, 2) won 9/9 autotuned shapes at
+# (64, 64, 128) on gfx1030, spanning LQ 8968-18815 (topk 41-78).
+#
+# Note: topk is a tl.constexpr (see kernel.py), so a genuinely new shape
+# still triggers a fresh Triton compile regardless of this shortcut -- what
+# this skips is the multi-candidate timing sweep (up to 2 compiles + reps
+# each), replacing it with a single direct compile using a config already
+# known to be optimal for this tile shape.
+#
+# Add entries here only after seeing real convergence in your own cache file
+# across a range of shapes, the way this one was. A different BLOCK_M/BLOCK_N
+# (e.g. block_size="128" on the node) or a different GPU arch has no data
+# backing it yet and should go through the full sweep below.
 _KNOWN_GOOD = {
     (64, 64, 128, "gfx1030"): (4, 2),
 }
@@ -200,11 +218,6 @@ _LADDER = {
     (32, 64): ((4, 2), (4, 1)),
     (128, 64): ((4, 2), (4, 1)),
     (64, 128): ((4, 2), (4, 1)),
-
-                                                                         
-                                                                         
-                                                                         
-                            
 }
 _CHOSEN: dict = {}  # in-process cache, avoids re-touching disk every call
 
