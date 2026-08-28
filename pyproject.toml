@@ -1,10 +1,10 @@
 [project]
-name = "comfyui-h3-sla-attention"
-description = "Block-sparse attention for MiniMax-H3 in ComfyUI."
+name = "comfyui-h3-sla-attention-rocm"
+description = "Block-sparse attention for MiniMax-H3 in ComfyUI for ROCM."
 version = "1.0.0"
 license = "MIT"
 
 [project.urls]
-Repository = "https://github.com/ethanfel/ComfyUI-PlagueKind-Nodes-only-sparse"
-Documentation = "https://github.com/ethanfel/ComfyUI-PlagueKind-Nodes-only-sparse#readme"
-"Bug Tracker" = "https://github.com/ethanfel/ComfyUI-PlagueKind-Nodes-only-sparse/issues"
+Repository = "https://github.com/patientx/ComfyUI-PlagueKind-Nodes-only-sparse"
+Documentation = "https://github.com/patientx/ComfyUI-PlagueKind-Nodes-only-sparse#readme"
+"Bug Tracker" = "https://github.com/patientx/ComfyUI-PlagueKind-Nodes-only-sparse/issues"
