@@ -198,8 +198,9 @@ def _attn_fwd(
 # (e.g. block_size="128" on the node) or a different GPU arch has no data
 # backing it yet and should go through the full sweep below.
 _KNOWN_GOOD = {
-    (64, 64, 128, "gfx1030"): (4, 2),   # block_size 64 best
-    (32, 32, 128, "gfx1030"): (4, 1),   # block_size 32 best
+    (64, 64, 128, "gfx1030"): (4, 2),   # block_size 64 best (rx 6800)
+    (32, 32, 128, "gfx1030"): (4, 1),   # block_size 32 best (rx 6800)
+    (128, 64, 128, "gfx1030"): (4, 2),  # block_size 128 best (rx 6800)
 }
 
 # Candidate (num_warps, num_stages) pairs to time per (BLOCK_M, BLOCK_N).
