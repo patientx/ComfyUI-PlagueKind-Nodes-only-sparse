@@ -206,7 +206,7 @@ class H3SLAAttention(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, sparsity_ratio=0.90, block_size="32",
+    def execute(cls, model, sparsity_ratio=0.90, block_size="64",
                 min_seq_len=8192, dense_last_steps=1, protect_audio=True,
                 enabled=True, dense_steps="", dense_backend="comfy_kitchen",
                 disable_fp16_accum=True, stabilize_motion=False,
