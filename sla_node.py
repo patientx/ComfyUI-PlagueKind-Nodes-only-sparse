@@ -2,7 +2,7 @@
 
 Drop it on the MODEL wire after the LoRA loaders, last before the sampler. It
 replaces MiniMax-H3 self-attention with the block-sparse kernel that the
-lightx2v SLA turbo LoRA was distilled against, which is the piece ComfyUI does
+SLA turbo LoRA was distilled against, which is the piece ComfyUI does
 not otherwise have -- and the reason that LoRA gives no speedup on its own.
 """
 
@@ -14,12 +14,13 @@ from comfy_api.latest import io
 
 log = logging.getLogger("H3Utils")
 
-BLOCK_SIZES = ("64", "128")
-# Matches kijai/ComfyUI-KJNodes' PatchSageAttentionKJ mode list exactly (see
-# sla/patch.py for the per-mode kernel + pv_accum_dtype each one calls),
+BLOCK_SIZES = ("32", "64", "128")
+REFERENCE_PROTECTION_MODES = ("True", "Light", "Off")
+# Mirrors an existing, widely-used sage-attention kernel dropdown's mode
+# list exactly (see sla/patch.py for the per-mode kernel + pv_accum_dtype
+# each one calls),
 # plus this node's own "pytorch" / "comfy_kitchen" / "auto" choices.
 DENSE_BACKENDS = (
-    "auto",
     "pytorch",
     "comfy_kitchen",
     "sage:auto",
@@ -27,6 +28,7 @@ DENSE_BACKENDS = (
     "sage:qk_int8_pv_fp16_triton",
     "sage:qk_int8_pv_fp8_cuda",
     "sage:qk_int8_pv_fp8_cuda++",
+    "auto",
 )
 
 
@@ -55,18 +57,16 @@ class H3SLAAttention(io.ComfyNode):
             category="CFZ/model_patches",
             description=(
                 "Block-sparse attention for MiniMax-H3, matching the inference "
-                "path the lightx2v SLA turbo LoRA was trained for. Place it "
-                "after your LoRA loader, last before the sampler. Long "
                 "sequences benefit most, so the gain grows with resolution and "
                 "duration; short ones fall back to dense automatically."),
             inputs=[
                 io.Model.Input("model",
-                    tooltip="MODEL, after the LoRA loader(s)."),
+                    tooltip="MODEL,"),
                 io.Float.Input("sparsity_ratio", default=0.90, min=0.0, max=0.95,
                     step=0.05, round=False,
                     tooltip=(
-                        "Fraction of key blocks skipped. 0.85 is what lightx2v "
-                        "ships and what the SLA turbo LoRA was distilled "
+                        "Fraction of key blocks skipped. 0.85 is the shipped default "
+                        "and what the SLA turbo LoRA was distilled "
                         "against; 0.90 is the value validated here and is "
                         "~15% faster. Sparsity did NOT turn out to drive the "
                         "speech artefacts on H3 -- step count did, so use 6 "
@@ -77,7 +77,7 @@ class H3SLAAttention(io.ComfyNode):
                         "cannot take 0.7+, this node has nothing to offer it. "
                         "0.0 disables sparsity without removing the node.")),
                 io.Combo.Input("block_size", options=list(BLOCK_SIZES),
-                    default="64",
+                    default="32",
                     tooltip=(
                         "How many sequence tokens share one key selection. "
                         "Unrelated to the model's 128-wide heads. This matters "
@@ -89,8 +89,9 @@ class H3SLAAttention(io.ComfyNode):
                         "time -- halving the block doubles the block count, so "
                         "the attention work is identical and only the routing "
                         "gets finer. Use 128 only if you generate without "
-                        "meaningful audio.")),
-                io.Int.Input("min_seq_len", default=4096, min=0, max=1000000,
+                        "meaningful audio. Coming down to 32 has increased "
+                        "the quality even further for marginal slowdown ")),
+                io.Int.Input("min_seq_len", default=8192, min=0, max=1000000,
                     step=1024, optional=True,
                     tooltip=(
                         "Sequences shorter than this stay dense. Guards two "
@@ -103,21 +104,21 @@ class H3SLAAttention(io.ComfyNode):
                     optional=True,
                     tooltip=(
                         "Run the last N sampling steps at full attention. 0 "
-                        "matches lightx2v exactly. 1 costs a little speed and "
+                        "matches the turbo LoRA's original distillation setup "
+                        "exactly. 1 costs a little speed and "
                         "can recover fine detail, since the final step's error "
                         "is the one you actually see. Stacks with dense_steps "
                         "below rather than replacing it.")),
                 io.Boolean.Input("protect_audio", default=True,
-                    label_on="protect", label_off="uniform (lightx2v parity)",
+                    label_on="protect", label_off="uniform (turbo parity)",
                     optional=True,
                     tooltip=(
-                        "Always attend the [text | cond | audio] prefix, "
-                        "whatever top-k picks. Audio is about 1% of the packed "
-                        "sequence -- 19 key blocks of 1794 at 768p/15s -- so "
-                        "plain top-k regularly drops all of it and the "
-                        "soundtrack degrades while the video still looks fine. "
-                        "Costs roughly 7%. Turn off only to reproduce "
-                        "lightx2v's uniform selection exactly.")),
+                        "Always attend blocks overlapping actual language "
+                        "tokens, target audio, and audio-reference segments. "
+                        "Visual-reference blocks are controlled separately. "
+                        "Disable only for turbo-style uniform sparsity; "
+                        "testing found partial or unprotected audio unstable "
+                        "for very little speed gain.")),
                 io.Boolean.Input("enabled", default=True,
                     label_on="sparse", label_off="dense (bypass)",
                     optional=True,
@@ -138,34 +139,35 @@ class H3SLAAttention(io.ComfyNode):
                         "can fix prompt-following regressions without paying "
                         "for full attention on every step. Blank = none.")),
                 io.Combo.Input("dense_backend", options=list(DENSE_BACKENDS),
-                    default="auto", optional=True,
+                    default="comfy_kitchen", optional=True,
                     tooltip=(
                         "Attention kernel used on every dense fall-through "
                         "(short sequences, dense_last_steps, dense_steps). "
-                        "'auto' (default here) calls whatever the environment "
-                        "already resolved -- order-dependent on how other "
-                        "attention-patching nodes are wired, but matches "
-                        "whatever the rest of your workflow is already using. "
-                        "'comfy_kitchen' (upstream's default) pins Comfy "
-                        "Kitchen's int8 backend -- fast enough on the handful "
-                        "of dense steps this node runs to be worth its "
-                        "precision tradeoff there, if you have it available. "
-                        "'pytorch' pins the plain reference kernel instead if "
-                        "you want zero quantization anywhere in the dense "
-                        "path, at real cost to dense-step speed. The "
-                        "'sage:*' modes match kijai/ComfyUI-KJNodes' "
-                        "PatchSageAttentionKJ dropdown one-for-one -- "
+                        "'comfy_kitchen' (default, Comfy Kitchen int8) is fast enough on "
+                        "the handful of dense steps this node runs to be "
+                        "worth its precision tradeoff there. 'pytorch' pins "
+                        "the plain reference kernel instead if you want zero "
+                        "quantization anywhere in the dense path, at real "
+                        "cost to dense-step speed -- dense steps are the "
+                        "ones this node already decided must be exact, so "
+                        "that's the safest choice if you're chasing maximum "
+                        "quality over speed there. The "
+                        "'sage:*' modes match an existing sage-attention "
+                        "kernel dropdown one-for-one -- "
                         "'sage:auto' lets the sageattention package pick; "
                         "the rest pin a specific kernel + pv_accum_dtype: "
                         "fp16_cuda uses fp32 accum (safest), fp8_cuda uses "
                         "fp32+fp32 (safest of the fp8 pair), fp8_cuda++ uses "
-                        "fp32+fp16 (faster, more overflow-prone). Needs the "
-                        "sageattention package installed; falls back to "
-                        "whatever's already active with a logged warning if "
-                        "it isn't, or if a specific kernel is missing from "
-                        "your installed version. The sparse path is "
-                        "unaffected by this setting either way -- it never "
-                        "goes through backend selection at all.")),
+                        "fp32+fp16 (faster, more overflow-prone -- try this "
+                        "first if fp8_cuda works but you want more speed). "
+                        "Needs the sageattention package installed; falls "
+                        "back to whatever's already active with a logged "
+                        "warning if it isn't, or if a specific kernel is "
+                        "missing from your installed version. 'auto' "
+                        "restores the old behaviour of using whatever "
+                        "backend is already active globally. The sparse path "
+                        "is unaffected by this setting either way -- it "
+                        "never goes through backend selection at all.")),
                 io.Boolean.Input("disable_fp16_accum", default=True,
                     label_on="disabled (recommended)", label_off="follow --fast",
                     optional=True,
@@ -176,25 +178,39 @@ class H3SLAAttention(io.ComfyNode):
                         "flag. Measured to cost quality on H3 with no "
                         "throughput gain. Turn off only to A/B against the "
                         "global flag.")),
-                io.Boolean.Input("stabilize_motion", default=True,
+                io.Boolean.Input("stabilize_motion", default=False,
                     label_on="on", label_off="off",
                     optional=True,
                     tooltip=(
                         "Bias each layer's block selection toward what it "
                         "picked last step, so a near-tie between two blocks "
                         "doesn't flip for no reason and show up as a faint "
-                        "double-exposure on fast motion. Costs essentially "
-                        "nothing, but it's a fix for that one specific "
-                        "symptom, not a general quality dial.")),
+                        "double-exposure on fast motion. Only target-video "
+                        "query rows are stabilized; text and audio choices "
+                        "remain step-local. It is a fix for that one specific "
+                        "symptom, not a general quality dial. - Uses more Vram ")),
+                io.Boolean.Input("reference_protection",
+                    display_name="Protect Vid/Ref",
+                    default=False, label_on="Light", label_off="Off",
+                    optional=True,
+                    tooltip=(
+                        "Protect Image/Video Reference. ON (Light) uses fixed "
+                        "0.85 reference sparsity and guarantees the "
+                        "best-scoring 15% of each visual-reference range. OFF "
+                        "adds no special quota; references still participate "
+                        "in ordinary top-k."
+                        "Default Off preserves the precise "
+                        "audio patch's fastest behaviour.")),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
-    def execute(cls, model, sparsity_ratio=0.90, block_size="64",
-                min_seq_len=4096, dense_last_steps=1, protect_audio=True,
-                enabled=True, dense_steps="", dense_backend="auto",
-                disable_fp16_accum=True, stabilize_motion=True) -> io.NodeOutput:
+    def execute(cls, model, sparsity_ratio=0.90, block_size="32",
+                min_seq_len=8192, dense_last_steps=1, protect_audio=True,
+                enabled=True, dense_steps="", dense_backend="comfy_kitchen",
+                disable_fp16_accum=True, stabilize_motion=False,
+                reference_protection=False) -> io.NodeOutput:
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
             return io.NodeOutput(model)
@@ -212,6 +228,7 @@ class H3SLAAttention(io.ComfyNode):
                 disable_fp16_accum=disable_fp16_accum,
                 protect_audio=protect_audio,
                 stabilize_motion=stabilize_motion,
+                reference_protection=("Light" if reference_protection else "Off"),
             )
         except Exception:                                # noqa: BLE001
             # Triton missing, an incompatible GPU, a ComfyUI API change -- none
