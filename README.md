@@ -79,10 +79,8 @@ dense backend was never invoked -- it isn't an error.
 
 - A current ComfyUI version with the V3 `comfy_api` and MiniMax-H3 support
 - PyTorch built for ROCm
-- Triton (ROCm build)
-- A ROCm-supported AMD GPU
-- An H3 SLA-compatible LoRA if you want the quality characteristics the sparse
-  backend was distilled for
+- Triton-windows `pip install triton-windows==3.7.0.post26` (compatible with ROCM) or triton in linux with ROCM compability
+- A ROCm-supported AMD GPU (this node works well with comfyui-rocm)
 
 The node is Triton-specific; a ROCm Triton build is required. If its imports
 fail, ComfyUI will continue to start but the node will not be registered.
@@ -96,17 +94,6 @@ git clone https://github.com/patientx/ComfyUI-PlagueKind-Nodes-only-sparse.git
 ```
 
 Restart ComfyUI after cloning.
-
-## Testing
-
-From this repository:
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-CPU-only environments run the integration-contract tests and skip GPU kernel
-tests automatically.
 
 ## Credits and license
 
