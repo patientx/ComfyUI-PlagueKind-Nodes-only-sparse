@@ -139,7 +139,7 @@ class H3SLAAttention(io.ComfyNode):
                         "can fix prompt-following regressions without paying "
                         "for full attention on every step. Blank = none.")),
                 io.Combo.Input("dense_backend", options=list(DENSE_BACKENDS),
-                    default="comfy_kitchen", optional=True,
+                    default="auto", optional=True,
                     tooltip=(
                         "Attention kernel used on every dense fall-through "
                         "(short sequences, dense_last_steps, dense_steps). "
