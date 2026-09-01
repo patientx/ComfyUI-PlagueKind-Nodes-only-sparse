@@ -39,14 +39,14 @@ kernel failures, it safely falls back to dense attention.
 | Setting | Default | Notes |
 | --- | ---: | --- |
 | `sparsity_ratio` | `0.90` | Fraction of key blocks skipped. Use `0.85` for LightX2V parity. Values below roughly `0.60` are unlikely to help. |
-| `block_size` | `32` | `64` and `128` share the same key-block granularity (`128` only widens the query tile) and measured near-identical on RDNA2 in testing so far. `32` gave a further quality bump for audio at marginal cost here, but has not shown a speed advantage on RDNA2 -- GPUs without tensor cores don't benefit from the finer tiling the way it was designed for. Try `64` first if you're unsure, and benchmark before trusting any block size to be faster on your card. |
+| `block_size` | `64` | `64` and `128` share the same key-block granularity (`128` only widens the query tile) and measured near-identical on RDNA2 in testing so far. `32` gave a further quality bump for audio at marginal cost here, but has not shown a speed advantage on RDNA2 -- GPUs without tensor cores don't benefit from the finer tiling the way it was designed for. Try `64` first if you're unsure, and benchmark before trusting any block size to be faster on your card. |
 | `min_seq_len` | `8192` | Keeps short attention calls dense, where routing overhead outweighs the saving. |
 | `dense_last_steps` | `1` | Optionally uses dense attention for the final sampling steps. |
 | `dense_steps` | `""` (empty) | Explicit extra dense step indices. Leave empty -- even `"0"` measurably slows things down on RDNA2, it is not a no-op. |
 | `protect_audio` | `true` | Preserves attention to the packed text/conditioning/audio prefix. |
 | `reference_protection` | `Off` | `Light` guarantees the best ~15% of every visual-reference range without displacing ordinary video picks; `True` guarantees all of it. Not yet exercised on ROCm -- test against a known-good run before relying on it. |
 | `stabilize_motion` | `false` | Sticky bonus for query rows on/after the video segment, to cut down blocks flipping frame to frame. Off by default upstream; costs a little extra state/VRAM if enabled. |
-| `dense_backend` | `comfy_kitchen` | Pins dense fall-throughs to a specific kernel. `auto` restores calling whatever the environment already resolved. |
+| `dense_backend` | `auto` | Pins dense fall-throughs to a specific kernel. `auto` restores calling whatever the environment already resolved. |
 | `enabled` | `true` | Provides a convenient dense bypass without rewiring the workflow. |
 
 Long sequences benefit most. Logs under `H3Utils` report whether the sparse
