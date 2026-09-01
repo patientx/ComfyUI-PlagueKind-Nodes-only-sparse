@@ -31,46 +31,18 @@ Layout at the call site: q/k/v arrive ``[1, 56, S, 128]`` bf16 with
    kernel that fails on 100% of calls (e.g. a dtype it can't handle) looks
    identical in the log to a guard-condition rejection, which cost real time
    to tell apart the first time this happened here.
+4. The sage dense-path fp32 tolerance mirrors point 1: sageattention's own
+   kernels reject fp32 outright with no fallback, unlike KJNodes' node which
+   catches that and silently downgrades. Calling sageattention directly (see
+   _build_sage_dense_fn) bypasses that catch, so q/k/v get cast to bf16
+   around the call and back afterward when they arrive as anything other
+   than bf16/fp16.
 
 Note this node's design assumes tensor-core hardware (the many small
 per-block tl.dot calls in kernel.py are what tensor cores are good at
 amortizing); on GPUs without that, correct sparsification does not
-necessarily mean a net speedup even after both fixes above. Benchmark against
+necessarily mean a net speedup even after the fixes above. Benchmark against
 your own dense baseline before trusting the "faster" default assumption.
-
---- Everything else below is merged from upstream, full parity ---
-dense_backend: pins every dense fall-through to a specific named attention
-kernel (comfy_kitchen / pytorch / a specific sage:<mode>), resolved by direct
-module import rather than by capturing whatever attention-override node
-happened to run earlier in the workflow.
-
-dense_steps: explicit 0-based step indices forced dense, on top of
-dense_last_steps -- lets early composition-setting steps stay exact without
-paying full-attention cost on every step.
-
-disable_fp16_accum: forces off the fp16/bf16 reduced-precision matmul
-reduction path (what --fast fp16_accumulation enables) for this model's
-sampling run, regardless of the global launch flag.
-
-stabilize_motion: biases each layer's block selection toward what it picked
-last step (see block_map.py's prev_lut), to reduce a block flipping between
-near-tied candidates step to step, visible on fast motion as a faint
-double-exposure.
-
-Spectrum-aware step resolution (_resolve_sampler_step / _prepare_run_state /
-_reset_run_state / _call_next_wrapper / _sequence_scalar): Spectrum is a
-companion node that can forecast a sampler step without invoking the
-diffusion model at all. Counting wrapper invocations therefore counts actual
-NFEs, not sampler steps, and drifts out of sync with dense_steps/
-dense_last_steps if any step gets skipped that way. ComfyUI exposes both the
-complete schedule (sample_sigmas) and the live raw sigma (sigmas);
-_resolve_sampler_step recovers the true sampler position by matching the two,
-so step counting stays correct whether or not Spectrum -- or anything else
-that can skip model calls -- is in the graph. _call_next_wrapper also
-replaces a bare executor.original() call: that would jump straight to the
-base model and silently skip every wrapper installed *after* this one (e.g.
-Spectrum's own H3 instrumentation), where advancing the wrapper chain
-preserves them.
 """
 
 from __future__ import annotations
@@ -80,7 +52,7 @@ import logging
 
 import torch
 
-from .block_map import get_block_map
+from .block_map import get_block_map, get_protected_block_ranges
 from .kernel import block_sparse_attention
 
 log = logging.getLogger("H3Utils")
@@ -248,7 +220,7 @@ def _resolve_backend(name):
     ``func`` -- that resolves whatever the launch flags or an attention
     override node currently have active (e.g. ``--use-ck-attention``), which
     is exactly what a pinned ``dense_backend`` needs to bypass. Returns None
-    for "auto" (meaning: use whatever ``func`` is, the old behaviour) or when
+    for \"auto\" (meaning: use whatever ``func`` is, the old behaviour) or when
     nothing matching was found on this ComfyUI install.
     """
     if name in (None, "auto"):
@@ -308,7 +280,7 @@ def _new_state():
     return {
         "calls": 0,        # sparse invocations this run
         "dense": 0,        # fall-throughs this run
-        "step": 0,          # logical sampler step, 1-based
+        "step": 0,         # logical sampler step, 1-based
         "n_steps": 0,
         "last_step_index": None,
         "summarized": False,
@@ -316,12 +288,12 @@ def _new_state():
         "kept": 0,
         "blocks": 0,
         "pinned": 0,
-        "backend": None,        # what we displaced
+        "backend": None,   # what we displaced
         "dense_backend": None,  # what dense steps actually ran on
         "failed": None,    # first kernel failure, if any
-        "fp16_saved": None,   # (fp16, bf16) matmul reduction flags to restore
-        "call_idx": 0,         # this step's call count, for stabilize_motion
-        "prev_lut": {},        # call_idx -> last sparse lut, for stabilize_motion
+        "fp16_saved": None,     # (fp16, bf16) matmul reduction flags to restore
+        "call_idx": 0,       # this step's call count, for stabilize_motion
+        "prev_lut": {},      # call_idx -> last sparse lut, for stabilize_motion
     }
 
 
@@ -374,20 +346,25 @@ def _summarise(state, sparsity, blkq, blkk):
 
 
 def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
-                   protect_audio=True, dense_fn=None, stabilize_motion=False):
-    """``dense_fn``, when not None, is a specific backend that every dense
-    fall-through uses instead of ``func``. Without it, ``func`` is whatever
-    ``optimized_attention`` currently resolves to. Pinning ``dense_fn`` makes
-    the dense path deterministic regardless of what else is wired into the
-    workflow; the sparse path is unaffected either way, since it never calls
-    ``func`` at all.
+                   protect_audio=True, dense_fn=None, stabilize_motion=False,
+                   reference_sparsity=None):
+    """``dense_fn``, when not None, is a specific backend (e.g. always
+    ``attention_pytorch``) that every dense fall-through uses instead of
+    ``func``. Without it, ``func`` is whatever ``optimized_attention``
+    currently resolves to -- which can be ck-attention under
+    ``--use-ck-attention`` or an attention-override node, and running the
+    dense steps on ck measurably loses quality versus pytorch. Pinning
+    ``dense_fn`` makes the dense path deterministic regardless of what else
+    is set globally; the sparse path is unaffected either way, since it
+    never calls ``func`` at all.
 
-    ``stabilize_motion`` carries each layer's previously-selected key blocks
-    into ``get_block_map`` as a tie-breaker (see block_map.py). ``call_idx``
+    ``stabilize_motion`` carries each layer's near-cutoff target-video choices
+    into ``get_block_map`` as a tie-breaker (see block_map.py). Text and audio
+    query routing remains step-local. ``state["call_idx"]``
     is the layer identity this relies on -- it counts calls within the
-    current step, reset to 0 by the wrapper at the top of every step; this
-    works because the model graph is static, so the Nth attention call
-    happens in the same layer every step.
+    current step, reset to 0 by the wrapper at the top of every step, and it
+    works because the model graph is static: the Nth attention call happens
+    in the same layer every step.
     """
     topk_ratio = 1.0 - sparsity_ratio
 
@@ -433,6 +410,22 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             if not qb.is_contiguous():
                 qb, kb, vb = qb.contiguous(), kb.contiguous(), vb.contiguous()
 
+            # Audio/language protection is deliberately all-or-nothing: testing
+            # found partial audio quotas unstable for negligible speed benefit.
+            # Visual references retain their independent sparse quota.
+            protected_ranges = None
+            prefix = 0
+            if protect_audio:
+                protected_ranges = to.get("_h3sla_protected_ranges")
+                if protected_ranges is None:
+                    prefix = int(to.get("_h3sla_prefix", 0) or 0)
+            if prefix >= S:
+                prefix = 0
+            stabilize_query_from = int(
+                to.get("_h3sla_stabilize_query_from", 0) or 0
+            )
+            reference_ranges = to.get("_h3sla_reference_ranges")
+
             # NOTE: local addition, not present upstream. Downcast only the
             # surviving sparse-kernel compute, cast back before returning.
             # Watch for NaN/overflow on fp16's narrower exponent range -- the
@@ -445,15 +438,6 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
                 kb = kb.to(_SPARSE_COMPUTE_DTYPE)
                 vb = vb.to(_SPARSE_COMPUTE_DTYPE)
 
-            # Pin the [text | cond | audio] prefix into every query's
-            # selection. Audio is ~1% of the packed sequence, so plain top-k
-            # routinely drops all of it and the soundtrack degrades while the
-            # video stays fine. 0 when the layout is unavailable, which simply
-            # disables the protection rather than guessing.
-            prefix = int(to.get("_h3sla_prefix", 0) or 0) if protect_audio else 0
-            if prefix >= S:
-                prefix = 0
-
             call_idx = state["call_idx"]
             state["call_idx"] = call_idx + 1
             prev_lut = state["prev_lut"].get(call_idx) if stabilize_motion else None
@@ -461,16 +445,24 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             if stabilize_motion:
                 lut, topk, history = get_block_map(
                     qb, kb, topk_ratio, blkq, blkk,
-                    protect_upto=prefix, prev_lut=prev_lut, return_history=True,
+                    protect_upto=prefix, prev_lut=prev_lut,
+                    protect_ranges=protected_ranges, return_history=True,
+                    stabilize_query_from=stabilize_query_from,
+                    reference_ranges=reference_ranges,
+                    reference_sparsity=reference_sparsity,
                 )
                 # Only the bounded boundary slice is retained -- see
                 # block_map.py. Storing the full lut here is what made this
                 # grow to several GB per run at 768p with stabilize_motion on.
                 state["prev_lut"][call_idx] = history
             else:
-                lut, topk = get_block_map(qb, kb, topk_ratio, blkq, blkk,
-                                          protect_upto=prefix, prev_lut=prev_lut)
-
+                lut, topk = get_block_map(
+                    qb, kb, topk_ratio, blkq, blkk,
+                    protect_upto=prefix, prev_lut=prev_lut,
+                    protect_ranges=protected_ranges,
+                    reference_ranges=reference_ranges,
+                    reference_sparsity=reference_sparsity,
+                )
             out = block_sparse_attention(qb, kb, vb, lut, topk, blkq, blkk)
 
             if out.dtype != orig_dtype:
@@ -480,7 +472,11 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             state["seq"] = S
             state["kept"] = topk
             state["blocks"] = (S + blkk - 1) // blkk
-            state["pinned"] = (prefix + blkk - 1) // blkk
+            state["pinned"] = sum(
+                last - first for first, last in get_protected_block_ranges(
+                    prefix, protected_ranges, blkk, state["blocks"]
+                )
+            )
 
             # [1, S, H, D] -> what the caller expects
             if skip_output_reshape:
@@ -506,8 +502,8 @@ def _call_next_wrapper(executor, *args, **kwargs):
     advances to the next registered wrapper. Calling ``executor.original`` here
     would bypass every wrapper installed after SLA (for example Spectrum's H3
     instrumentation), which makes those patches silently lose the native model
-    call. The type fallback only preserves the tiny executor shims used by
-    older compatibility harnesses.
+    call. The type fallback only preserves the tiny executor shims used by this
+    package's historical unit tests and older compatibility harnesses.
     """
     if not isinstance(executor, type) and callable(executor):
         return executor(*args, **kwargs)
@@ -521,6 +517,77 @@ def _sequence_scalar(value):
             return None
         return float(value[0])
     return None
+
+
+def _tagged_text_ranges(start, stop, text_token_tags, wanted_tag, fallback):
+    """Return contiguous spans for one H3 presentation-token tag."""
+    if text_token_tags is None:
+        return fallback
+    try:
+        if hasattr(text_token_tags, "reshape"):
+            tags = text_token_tags.reshape(-1).tolist()
+        else:
+            tags = list(text_token_tags)
+    except (AttributeError, TypeError, ValueError):
+        return fallback
+
+    expected = int(stop) - int(start)
+    if len(tags) != expected:
+        return fallback
+    try:
+        tags = [int(tag) for tag in tags]
+    except (TypeError, ValueError):
+        return fallback
+
+    ranges = []
+    run_start = None
+    for offset, tag in enumerate(tags):
+        is_wanted = tag == wanted_tag
+        if is_wanted and run_start is None:
+            run_start = offset
+        elif not is_wanted and run_start is not None:
+            ranges.append((int(start) + run_start, int(start) + offset))
+            run_start = None
+    if run_start is not None:
+        ranges.append((int(start) + run_start, int(stop)))
+    return tuple(ranges)
+
+
+def _language_token_ranges(start, stop, text_token_tags):
+    """Return language spans, safely falling back to the whole text segment."""
+    return _tagged_text_ranges(
+        start, stop, text_token_tags, 1, ((int(start), int(stop)),)
+    )
+
+
+def _vision_token_ranges(start, stop, text_token_tags):
+    """Return Qwen vision spans; missing tags mean no optional reference quota."""
+    return _tagged_text_ranges(start, stop, text_token_tags, 0, ())
+
+
+REFERENCE_LIGHT_SPARSITY = 0.85
+
+
+def _resolve_reference_sparsity(reference_protection):
+    """Resolve True/Light/Off; old Manual workflows migrate to fixed Light."""
+    if reference_protection is True:
+        mode = "true"
+    elif reference_protection is False or reference_protection is None:
+        mode = "off"
+    else:
+        mode = str(reference_protection).strip().lower()
+    if mode == "true":
+        return mode, 0.0
+    if mode in ("light", "manual"):
+        return "light", REFERENCE_LIGHT_SPARSITY
+    return "off", None
+
+
+def _resolve_audio_protection(protect_audio):
+    """Resolve the Boolean switch and safely read workflows saved during PR #1."""
+    if isinstance(protect_audio, str):
+        return protect_audio.strip().lower() not in ("off", "false", "0", "no")
+    return bool(protect_audio)
 
 
 def _resolve_sampler_step(transformer_options):
@@ -629,7 +696,8 @@ def _set_fp16_accum(enabled):
 
 
 def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
-                  dense_steps=frozenset(), disable_fp16_accum=False):
+                  dense_steps=frozenset(), disable_fp16_accum=False,
+                  reference_quota_enabled=False):
     """DIFFUSION_MODEL wrapper: per-step state, and the end-of-run summary.
 
     Registered once and then reused -- ComfyUI caches node outputs, so this
@@ -667,18 +735,42 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
             # reduced-precision reduction path while this model is patched.
             _set_fp16_accum(False)
 
-        # PackedLayout.segments is [(start, stop, kind), ...] over
-        # [text | cond/ref | audio | video]; the video start is therefore the
-        # length of everything that must stay exactly attended. It lives on the
-        # payload, which never reaches the attention call site, so the wrapper
-        # is the only place it can be picked up.
+        # Preserve the historical prefix for compatibility, but current H3
+        # payloads let us protect language/audio spans precisely while leaving
+        # Qwen vision and visual conditioning/reference rows sparse. Motion
+        # hysteresis begins only at the target-video segment.
         prefix = 0
+        protected_ranges = []
+        reference_ranges = []
         layout = minimax_payload.get("layout") if minimax_payload else None
+        text_token_tags = (
+            minimax_payload.get("text_token_tags") if minimax_payload else None
+        )
         for seg in getattr(layout, "segments", ()) or ():
-            if len(seg) == 3 and seg[2] == "video":
-                prefix = int(seg[0])
-                break
+            if len(seg) != 3:
+                continue
+            start, stop, kind = seg
+            if kind == "text":
+                protected_ranges.extend(
+                    _language_token_ranges(start, stop, text_token_tags)
+                )
+                if reference_quota_enabled:
+                    reference_ranges.extend(
+                        _vision_token_ranges(start, stop, text_token_tags)
+                    )
+            elif kind in ("ref_audio", "audio"):
+                protected_ranges.append((int(start), int(stop)))
+            elif (
+                reference_quota_enabled
+                and kind in ("cond", "ref_img", "ref_video", "video_ref")
+            ):
+                reference_ranges.append((int(start), int(stop)))
+            elif kind == "video" and prefix == 0:
+                prefix = int(start)
         to["_h3sla_prefix"] = prefix
+        to["_h3sla_protected_ranges"] = tuple(protected_ranges)
+        to["_h3sla_reference_ranges"] = tuple(reference_ranges)
+        to["_h3sla_stabilize_query_from"] = prefix
 
         step0 = state["step"] - 1  # 0-based, for dense_steps membership
         to["_h3sla_dense"] = bool(
@@ -692,7 +784,6 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
         # crash mid-sampling rather than the graceful no-op they should get.
         if minimax_payload is not None:
             kwargs["minimax_payload"] = minimax_payload
-
         try:
             out = _call_next_wrapper(
                 executor,
@@ -739,8 +830,9 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
 
 
 def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
-                 dense_last_steps=0, protect_audio=True, dense_backend="auto",
-                 dense_steps="", disable_fp16_accum=True, stabilize_motion=False):
+                 dense_last_steps=0, protect_audio=True, dense_backend="comfy_kitchen",
+                 dense_steps="", disable_fp16_accum=True, stabilize_motion=False,
+                 reference_protection="Off"):
     """Return a clone of ``model`` whose H3 self-attention runs block-sparse.
 
     Weights are untouched; this only installs an attention override and a
@@ -748,25 +840,34 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
 
     ``dense_backend`` pins every dense fall-through (short sequences,
     ``dense_last_steps``, and explicit ``dense_steps``) to a specific
-    attention kernel. "auto" (default here; upstream defaults to
-    "comfy_kitchen") calls whatever ``func`` the environment already
-    resolved. "pytorch" pins the plain reference kernel. "comfy_kitchen"
-    pins Comfy Kitchen's int8 backend. "sage:<mode>" pins a specific
-    sageattention kernel by name (see SAGE_MODES) via direct import of the
-    ``sageattention`` package, independent of node order or whether a
-    Sage-patching node is even present in the workflow.
-
-    ``dense_steps`` is an explicit "0,2,4-6"-style spec of 0-based step
-    indices forced dense on top of ``dense_last_steps``.
+    attention kernel -- default "comfy_kitchen" (Comfy Kitchen int8), since it's fast
+    enough on the handful of dense steps this node runs to be worth its
+    precision tradeoff there. "pytorch" pins the plain reference kernel
+    instead if you want zero quantization anywhere in the dense path, at
+    real cost to dense-step speed. "auto" restores the old behaviour of
+    calling whatever the environment already resolved (e.g.
+    ``--use-ck-attention`` or an attention-override node) -- note this can
+    silently differ run to run if that global setting changes.
 
     ``disable_fp16_accum`` forces off the fp16/bf16 reduced-precision matmul
     reduction (what ``--fast fp16_accumulation`` enables) for the duration of
-    this model's sampling run, regardless of the global launch flag.
+    this model's sampling run, regardless of the global launch flag --
+    measured to cost quality on H3 for no throughput gain.
 
     ``stabilize_motion`` biases block selection toward what each layer picked
     last step (see block_map.py's ``prev_lut``), to cut down on a block
     flipping between two near-tied candidates step to step for no reason tied
     to actual content -- visible on fast motion as a faint double-exposure.
+    Off by default: it's a real fix for that specific symptom, not a general
+    quality dial, and adds a small amount of state to carry between steps.
+
+    ``protect_audio`` is an all-or-nothing safety switch for language,
+    reference-audio, and target-audio ranges.
+
+    ``reference_protection`` controls a separate visual-reference quota:
+    ``Off`` leaves references to global top-k, ``True`` guarantees all of them,
+    and ``Light`` guarantees the best 15% of every reference range without
+    displacing ordinary video choices.
     """
     blkq = int(block_size)
     # BLKK=64 is not a typo. On sm_120 the 128x128 tile needs 160 KB of shared
@@ -777,6 +878,10 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
 
     dense_fn = _resolve_backend(dense_backend)
     dense_step_set = _parse_step_spec(dense_steps)
+    reference_mode, reference_sparsity = _resolve_reference_sparsity(
+        reference_protection
+    )
+    protect_audio = _resolve_audio_protection(protect_audio)
 
     state = _new_state()
     patched = model.clone()
@@ -784,23 +889,28 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     to = patched.model_options.get("transformer_options", {}).copy()
     to["optimized_attention_override"] = _make_override(
         state, float(sparsity_ratio), blkq, blkk, int(min_seq_len),
-        bool(protect_audio), dense_fn=dense_fn,
-        stabilize_motion=bool(stabilize_motion))
+        protect_audio=protect_audio, dense_fn=dense_fn,
+        stabilize_motion=bool(stabilize_motion),
+        reference_sparsity=reference_sparsity)
     patched.model_options["transformer_options"] = to
 
     patched.add_wrapper_with_key(
         "diffusion_model", "h3_sla_state",
         _make_wrapper(state, float(sparsity_ratio), blkq, blkk,
                       int(dense_last_steps), dense_steps=dense_step_set,
-                      disable_fp16_accum=bool(disable_fp16_accum)),
+                      disable_fp16_accum=bool(disable_fp16_accum),
+                      reference_quota_enabled=reference_sparsity is not None),
     )
 
     log.info(
         "[H3Utils] SLA installed | sparsity=%.2f | BLK=%dx%d | min_seq_len=%d | "
         "dense_last_steps=%d | dense_steps=%s | dense_backend=%s | "
-        "protect_audio=%s | disable_fp16_accum=%s | stabilize_motion=%s",
+        "protect_audio=%s | reference_protection=%s%s | "
+        "disable_fp16_accum=%s | stabilize_motion=%s",
         sparsity_ratio, blkq, blkk, min_seq_len, dense_last_steps,
         sorted(dense_step_set) or "-", dense_backend, protect_audio,
+        reference_mode,
+        ("(%.2f)" % reference_sparsity) if reference_sparsity is not None else "",
         disable_fp16_accum, stabilize_motion,
     )
     return patched
