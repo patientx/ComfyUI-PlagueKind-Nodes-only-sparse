@@ -48,6 +48,7 @@ kernel failures, it safely falls back to dense attention.
 | `stabilize_motion` | `false` | Sticky bonus for query rows on/after the video segment, to cut down blocks flipping frame to frame. Off by default upstream; costs a little extra state/VRAM if enabled. |
 | `dense_backend` | `auto` | Pins dense fall-throughs to a specific kernel. `auto` restores calling whatever the environment already resolved. |
 | `enabled` | `true` | Provides a convenient dense bypass without rewiring the workflow. |
+| `h3_cache` | `off` | Applies a block-stack residual cache before SLA (skips recompute on low-change steps). Fixed settings: threshold `0.05`, range `15%-90%`, max `2` consecutive skips, `auto` device, verbose logging. See Credits. |
 
 Long sequences benefit most. Logs under `H3Utils` report whether the sparse
 path actually ran and summarize the number of key blocks retained, e.g.:
@@ -109,5 +110,11 @@ tier, `protect_ranges` generalization, and `stabilize_motion` scoping fix
 (see `CHANGELOG.md`); upstream's kernel-side 5090/sm_120 autotune ladder was
 not merged, as it has no ROCm relevance -- RDNA2-specific timed/cached
 autotuning is kept in its place.
+
+The optional `h3_cache` toggle's block-stack residual caching approach is
+based on [ComfyUI-MiniMaxH3-Cache](https://github.com/lihaoyun6/ComfyUI-MiniMaxH3-Cache)
+by lihaoyun6 (GPL-3.0), reimplemented here as a reversible `ModelPatcher`
+patch on a cloned model (rather than a global class patch) and ported to the
+current `io.ComfyNode` API and MiniMax H3 forward signature.
 
 See [LICENSE](LICENSE).
