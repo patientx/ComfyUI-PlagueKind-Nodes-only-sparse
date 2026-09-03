@@ -125,11 +125,6 @@ class H3SLAAttention(io.ComfyNode):
                     tooltip=(
                         "Turn off to pass the model straight through, for a "
                         "like-for-like speed baseline without rewiring.")),
-                # Everything below this line was added after the original
-                # release. Kept at the end, in the order added, so old saved
-                # workflows -- which can store widget values positionally --
-                # keep lining up with the right inputs instead of shifting
-                # onto whatever got inserted ahead of them.
                 io.String.Input("dense_steps", default="", optional=True,
                     tooltip=(
                         "Explicit 0-based step indices to force dense, on top "
@@ -139,7 +134,7 @@ class H3SLAAttention(io.ComfyNode):
                         "can fix prompt-following regressions without paying "
                         "for full attention on every step. Blank = none.")),
                 io.Combo.Input("dense_backend", options=list(DENSE_BACKENDS),
-                    default="auto", optional=True,
+                    default="comfy_kitchen", optional=True,
                     tooltip=(
                         "Attention kernel used on every dense fall-through "
                         "(short sequences, dense_last_steps, dense_steps). "
@@ -189,6 +184,14 @@ class H3SLAAttention(io.ComfyNode):
                         "query rows are stabilized; text and audio choices "
                         "remain step-local. It is a fix for that one specific "
                         "symptom, not a general quality dial. - Uses more Vram ")),
+                io.Boolean.Input("h3_cache",
+                    default=False, label_on="on", label_off="off",
+                    optional=True,
+                    tooltip=(
+                        "Applies the H3 block-stack residual cache before SLA, "
+                        "fixed settings: reuse_threshold 0.05, start_percent "
+                        "0.15, end_percent 0.90, max_steps 2, device auto, "
+                        "verbose on.")),
                 io.Boolean.Input("reference_protection",
                     display_name="Protect Vid/Ref",
                     default=False, label_on="Light", label_off="Off",
@@ -206,11 +209,18 @@ class H3SLAAttention(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, sparsity_ratio=0.90, block_size="64",
+    def execute(cls, model, sparsity_ratio=0.90, block_size="32",
                 min_seq_len=8192, dense_last_steps=1, protect_audio=True,
                 enabled=True, dense_steps="", dense_backend="comfy_kitchen",
                 disable_fp16_accum=True, stabilize_motion=False,
-                reference_protection=False) -> io.NodeOutput:
+                h3_cache=False, reference_protection=False) -> io.NodeOutput:
+        if h3_cache:
+            try:
+                from .h3_cache import patch_h3_cache
+                model = patch_h3_cache(model)
+            except Exception:                              # noqa: BLE001
+                log.exception("[H3Utils] H3 cache patch failed; continuing without it.")
+
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
             return io.NodeOutput(model)
