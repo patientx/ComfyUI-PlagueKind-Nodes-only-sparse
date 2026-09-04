@@ -3,41 +3,18 @@
 sla_autotune_probe.py -- standalone AMD/ROCm config-sweep tool for the H3 SLA
 block-sparse attention kernel (ComfyUI-PlagueKind-Nodes-only-sparse fork).
 
-WHY THIS EXISTS
-----------------
-kernel.py's built-in autotune only catches triton.runtime.errors.OutOfResources
-at *launch* time. What actually happened on gfx1151 was different: the kernel
-compiled and launched fine (autotune logged "2/2 candidates viable"), but the
-launch triggered an illegal memory access on the GPU. HIP/Triton launches are
-asynchronous, so that fault doesn't surface in Python until the next
-synchronizing call -- which is why the traceback pointed at an unrelated
-`.to(orig_dtype)` cast several lines later, not at the kernel launch itself.
-A fault like that is a native abort (Windows: fatal exception 0x80000003,
-Linux: SIGABRT/SIGSEGV) that bypasses Python's except entirely and kills the
-whole process. No amount of try/except in the node can catch it.
-
-So: every (BLOCK_M, BLOCK_N, num_warps, num_stages) candidate here is timed in
-its OWN child process. If a child dies, only that one candidate is marked
-"crash" and the sweep moves on -- the parent process (and your ComfyUI
-install, since this script doesn't touch it) never goes down.
-
 USAGE
 -----
     python sla_autotune_probe.py
     python sla_autotune_probe.py --seq-len 17951 --heads 56
     python sla_autotune_probe.py --full          # wider warp/stage net + all 6 tile shapes
 
-Needs only torch + triton (whatever your ComfyUI-ROCm env already has) --
-no ComfyUI, no custom_nodes import. Run it with that same venv's python:
-
-    C:\\...\\python_env\\Scripts\\python.exe sla_autotune_probe.py
+Needs only torch + triton 
 
 OUTPUT
 ------
 Writes `sla_probe_<arch>.json` next to this script and prints a paste-ready
-snippet for kernel.py's `_KNOWN_GOOD` table. Send me the JSON file (plus your
-GPU model, e.g. "Ryzen AI Max+ 395 / Strix Halo") and I'll fold validated
-configs in for everyone on that arch.
+snippet for kernel.py's `_KNOWN_GOOD` table.
 """
 
 from __future__ import annotations
@@ -49,10 +26,6 @@ import sys
 import time
 from pathlib import Path
 
-# Real production tile shapes (see sla_node.py's BLOCK_SIZES + patch.py's
-# `blkk = 64 if blkq == 128 else blkq`): only these three are ever actually
-# used. The rest of kernel.py's _LADDER dict covers configs no user-facing
-# setting reaches.
 DEFAULT_SHAPES = [(32, 32), (64, 64), (128, 64)]
 ALL_SHAPES = [(32, 32), (64, 32), (32, 64), (64, 64), (128, 64), (64, 128)]
 
@@ -80,8 +53,6 @@ def _run_worker(cfg: dict) -> None:
         M_BLOCKS: tl.constexpr, D: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     ):
-        # Mirrors kernel.py's _attn_fwd exactly (duplicated here so this
-        # probe has zero dependency on the node package's layout/imports).
         idx_m = tl.program_id(0).to(tl.int64)
         idx_bh = tl.program_id(1).to(tl.int64)
         idx_b = idx_bh // H
