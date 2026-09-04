@@ -191,7 +191,9 @@ def _attn_fwd(
 # still triggers a fresh Triton compile regardless of this shortcut -- what
 # this skips is the multi-candidate timing sweep (up to 2 compiles + reps
 # each), replacing it with a single direct compile using a config already
-# known to be optimal for this tile shape.
+# known to be optimal for this tile shape. On gfx1151 this also means only
+# ONE kernel is ever compiled+launched in-process for a given shape, rather
+# than the sweep's two-then-a-third -- see the gfx1151 module note above.
 #
 # Add entries here only after seeing real convergence in your own cache file
 # across a range of shapes, the way this one was. A different BLOCK_M/BLOCK_N
@@ -201,6 +203,13 @@ _KNOWN_GOOD = {
     (64, 64, 128, "gfx1030"): (4, 2),   # block_size 64 best (rx 6800)
     (32, 32, 128, "gfx1030"): (4, 1),   # block_size 32 best (rx 6800)
     (128, 64, 128, "gfx1030"): (4, 2),  # block_size 128 best (rx 6800)
+    # AMD Radeon 8050S (Strix Halo APU), via sla_autotune_probe.py at
+    # LQ=LK=53067, sparsity=0.90 -- fastest clean config per tile shape,
+    # all measured well clear of the shared-memory ceiling that only
+    # bit the untested (64, 128) shape this node never actually uses.
+    (32, 32, 128, "gfx1151"): (8, 2),   # 
+    (64, 64, 128, "gfx1151"): (4, 2),   # 
+    (128, 64, 128, "gfx1151"): (8, 2),  # 
 }
 
 # Candidate (num_warps, num_stages) pairs to time per (BLOCK_M, BLOCK_N).
@@ -218,7 +227,7 @@ _LADDER = {
     (64, 64): ((4, 2), (4, 1)),
     (64, 32): ((4, 2), (4, 1)),
     (32, 64): ((4, 2), (4, 1)),
-    (32, 32): ((4, 2), (4, 1)),  # for block_size 32
+    (32, 32): ((4, 2), (4, 1)),
     (128, 64): ((4, 2), (4, 1)),
     (64, 128): ((4, 2), (4, 1)),
 }
