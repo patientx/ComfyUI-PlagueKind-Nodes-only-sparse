@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 sla_autotune_probe.py -- standalone AMD/ROCm config-sweep tool for the H3 SLA
-block-sparse attention kernel (ComfyUI-PlagueKind-Nodes-only-sparse fork).
+block-sparse attention kernel (github.com/patientx/comfyui-h3-sla-attention-rocm).
 
 USAGE
 -----
